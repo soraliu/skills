@@ -1,0 +1,4 @@
+interface:
+  display_name: "Understand Repository"
+  short_description: "Research repositories into contributor-ready guides"
+  default_prompt: "Use $understand-repo to research this GitHub repository and create an evidence-backed learning report."
