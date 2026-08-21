@@ -1,0 +1,4 @@
+interface:
+  display_name: "Discover Open Source"
+  short_description: "Discover, evaluate, and replace outdated open-source projects"
+  default_prompt: "Use $discover-open-source to find strong open-source projects for my topic and explain which former leaders are now outdated."
