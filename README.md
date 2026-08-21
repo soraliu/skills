@@ -16,6 +16,20 @@ $discover-open-source 本地 AI 编码 Agent
 /discover-open-source 本地 AI 编码 Agent
 ```
 
+### `understand-repo`
+
+输入一个公开 GitHub 仓库 URL，先根据学习者背景定制研究路径，再生成带固定源码证据、运行验证、贡献路径和最终交互考核的项目学习报告。
+
+```text
+# Codex
+$understand-repo https://github.com/owner/repo
+$understand-repo assess repo
+
+# Claude Code / Hermes
+/understand-repo https://github.com/owner/repo
+/understand-repo assess repo
+```
+
 ## 安装
 
 使用 [skills CLI](https://github.com/vercel-labs/skills) 安装：
@@ -23,6 +37,9 @@ $discover-open-source 本地 AI 编码 Agent
 ```bash
 # 交互选择 Harness
 npx skills add soraliu/skills --skill discover-open-source
+
+# 安装仓库理解 Skill
+npx skills add soraliu/skills --skill understand-repo
 
 # Codex
 npx skills add soraliu/skills --skill discover-open-source --agent codex
@@ -59,12 +76,14 @@ Codex 也可以通过 `$skill-installer` 安装：
 
 ```text
 $skill-installer install https://github.com/soraliu/skills/tree/main/skills/discover-open-source
+$skill-installer install https://github.com/soraliu/skills/tree/main/skills/understand-repo
 ```
 
 Hermes 可以直接安装单个 Skill，或把仓库注册为 tap：
 
 ```bash
 hermes skills install soraliu/skills/skills/discover-open-source
+hermes skills install soraliu/skills/skills/understand-repo
 
 hermes skills tap add soraliu/skills
 hermes skills install soraliu/skills/discover-open-source
