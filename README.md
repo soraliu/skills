@@ -31,6 +31,30 @@ npx skills add soraliu/skills --skill discover-open-source --agent codex
 npx skills add soraliu/skills --skill discover-open-source --agent claude-code
 ```
 
+### Codex 全局安装与手动同步
+
+先查看仓库当前提供的 Skill：
+
+```bash
+npx skills add soraliu/skills --list
+```
+
+安装或刷新仓库中的全部 Skill：
+
+```bash
+npx skills add soraliu/skills --skill '*' --agent codex --global --yes
+```
+
+每次执行都会重新读取仓库，并安装新 Skill、覆盖已有版本。`'*'` 包含仓库未来新增的 Skill，也可能覆盖同名的全局 Skill，因此更新前应先运行 `--list` 检查。
+
+验证 Codex 的全局安装结果：
+
+```bash
+npx skills list --global --agent codex --json
+```
+
+Codex 会自动读取本地 Skill 变化。如果当前会话仍显示旧内容，请重启 Codex。
+
 Codex 也可以通过 `$skill-installer` 安装：
 
 ```text
