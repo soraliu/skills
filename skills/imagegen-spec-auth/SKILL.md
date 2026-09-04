@@ -1,6 +1,6 @@
 ---
 name: imagegen-spec-auth
-description: "通过指定 auth JSON 发现 OpenAI 兼容 Image API 的可用模型，优先使用 gpt-image-2，不可用时安全回退到其他图片生成模型；禁止超时重试和重复扣款。"
+description: "通过指定 auth JSON 发现 OpenAI 兼容 Image API 的可用模型，优先使用 gpt-image-2，不可用时安全回退到其他图片生成模型；仅在服务端明确允许时安全重试，避免重复扣款。"
 ---
 
 # 使用指定 auth JSON 生成图片
@@ -15,7 +15,7 @@ description: "通过指定 auth JSON 发现 OpenAI 兼容 Image API 的可用模
 - 将 `url` 规范化为 API base：末尾已有 `/v1` 就保留，否则追加 `/v1`；避免 `/v1/v1`。
 - 生成前必须用同一 auth JSON 查询 `/v1/models`，从返回的可用模型中选择图片生成模型；精确匹配 `gpt-image-2` 时优先使用它，否则按脚本的图片模型识别与排序规则尝试其他候选。最终报告实际使用的模型，不要把模型列表当成生成成功证据。
 - 图片生成请求必须关闭 SDK 自动重试（`max_retries=0`），并为每个模型尝试发送幂等键（`Idempotency-Key`）。只有明确的模型不存在、不支持或参数不兼容错误才继续下一个候选；`429 insufficient_quota` / `credit_balance_exhausted`、认证失败、网络错误和提示词错误应立即停止，避免重复请求或重复扣费。
-- 生成超时、连接中断、HTTP 408/409/429 或 5xx 的结果可能已经在服务端扣费，视为“结果未知”：禁止自动重试、禁止回退其他模型，并提示保留 `request-id`。只有服务端支持幂等键且已核对请求状态时，才允许用户使用同一个 `--request-id` 重试；不要用新 ID 重试。
+- 生成超时、连接中断、HTTP 408/409/429 或 5xx 的结果可能已经在服务端扣费。只有当错误体明确包含 `retryable: true` 和不超过 300 秒的 `retry_after` 时，脚本才会等待并用同一个幂等键自动重试 1 次（Cloudflare 524 属于此类）；其他情况视为“结果未知”，禁止自动重试、禁止回退其他模型，并提示保留 `request-id`。若自动重试仍失败，只有在服务端支持幂等键且已核对请求状态时，才允许用户使用同一个 `--request-id` 重试；不要用新 ID 重试。
 
 ## 推荐执行
 
@@ -29,14 +29,14 @@ uv run --no-project --with openai python \
   --request-id "<本次逻辑请求 ID>"
 ```
 
-脚本默认 `1024x1024`、`medium`、单张输出，支持 `--size`、`--quality`、`--timeout`、`--request-id`、`--force` 和 `--auth`。不传 `--request-id` 时脚本自动生成并打印本次 ID；若发生超时，先确认服务端幂等键状态，再决定是否复用该 ID。生成结果应保存到项目的 `output/imagegen/`，再用 `view_image` 做视觉检查。
+脚本默认 `1024x1024`、`medium`、单张输出，支持 `--size`、`--quality`、`--timeout`、`--request-id`、`--force` 和 `--auth`。不传 `--request-id` 时脚本自动生成并打印本次 ID；服务端明确允许时脚本会自动按该 ID 重试 1 次，若最终仍失败，先确认服务端幂等键状态，再决定是否复用该 ID。生成结果应保存到项目的 `output/imagegen/`，再用 `view_image` 做视觉检查。
 
 ## 响应与常见陷阱
 
 - 先读取 `data[0].b64_json`；若为 `None`，检查 `data[0].url` 并立即下载。很多代理生成成功但只返回 URL，不能把 `b64_json=None` 当成生成失败。
 - URL 下载不应携带 API key，除非服务明确要求且 URL 属于同一受信任端点；优先使用代理返回的签名 URL。
 - `429 insufficient_quota` / `credit_balance_exhausted` 是额度问题，停止重试并提示更换有额度的凭据；不要循环重试。
-- 生成接口可能耗时数分钟：设置合理超时（脚本默认 300 秒）。超时后不要立刻启动第二个请求；先查询服务端是否已完成，确认幂等键支持后才可复用同一个 `request-id`。
+- 生成接口可能耗时数分钟：设置合理超时（脚本默认 300 秒）。仅对服务端明确标记 `retryable: true` 且提供有限 `retry_after` 的错误自动重试 1 次；其他超时后不要启动第二个请求，先查询服务端是否已完成，确认幂等键支持后才可复用同一个 `request-id`。
 - `openai` SDK 缺失时使用 `uv run --no-project --with openai ...`；不要修改系统或本技能自带的 `image_gen.py`。
 
 ## 交付检查

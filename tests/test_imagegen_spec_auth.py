@@ -71,6 +71,77 @@ class ImagegenSpecAuthTest(unittest.TestCase):
         self.assertEqual(stderr.getvalue().count("Calling "), 1)
         self.assertIn("结果未知", stderr.getvalue())
 
+    def test_provider_approved_retry_reuses_key_once(self):
+        calls = []
+        sleep_calls = []
+
+        class Retryable524(Exception):
+            status_code = 524
+            body = {"retryable": True, "retry_after": 2}
+            request_id = "provider-524-1"
+
+        class Images:
+            def generate(self, **kwargs):
+                calls.append(kwargs)
+                if len(calls) == 1:
+                    raise Retryable524("origin timeout")
+                return SimpleNamespace(
+                    data=[SimpleNamespace(b64_json=base64.b64encode(b"png").decode(), url=None)]
+                )
+
+        class Client:
+            def __init__(self, **kwargs):
+                self.images = Images()
+                self.models = SimpleNamespace(list=lambda: SimpleNamespace(data=[SimpleNamespace(id="gpt-image-2")]))
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "out.png"
+            auth, argv = self.auth_and_args(directory, output, "retry-1")
+            with patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=Client)}), patch.object(
+                sys, "argv", argv
+            ), patch.object(imagegen.time, "sleep", side_effect=sleep_calls.append):
+                self.assertEqual(imagegen.main(), 0)
+            generated = output.read_bytes()
+
+        self.assertEqual(generated, b"png")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[0]["extra_headers"]["Idempotency-Key"], calls[1]["extra_headers"]["Idempotency-Key"]
+        )
+        self.assertEqual(sleep_calls, [2.0])
+
+    def test_provider_approved_retry_is_bounded(self):
+        calls = []
+
+        class Retryable524(Exception):
+            status_code = 524
+            body = {"retryable": True, "retry_after": 0}
+
+        class Images:
+            def generate(self, **kwargs):
+                calls.append(kwargs)
+                raise Retryable524("origin timeout")
+
+        class Client:
+            def __init__(self, **kwargs):
+                self.images = Images()
+                self.models = SimpleNamespace(list=lambda: SimpleNamespace(data=[SimpleNamespace(id="gpt-image-2")]))
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "out.png"
+            auth, argv = self.auth_and_args(directory, output, "retry-bounded")
+            stderr = StringIO()
+            with patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=Client)}), patch.object(
+                sys, "argv", argv
+            ), patch.object(imagegen.time, "sleep") as sleep, redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    imagegen.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called_once_with(0.0)
+        self.assertIn("结果未知", stderr.getvalue())
+
     def test_fallback_uses_distinct_idempotency_keys_and_atomic_output(self):
         calls = []
         client_options = []
