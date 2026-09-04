@@ -5,17 +5,21 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+import uuid
 
 
 DEFAULT_AUTH = "~/.config/ai/imagegen.auth.json"
 DEFAULT_OUT = "output/imagegen/image.png"
+MAX_REQUEST_ID_LENGTH = 96
 
 # 排序值越小越优先；其余带有明确图片生成标识的模型排在已知模型之后。
 KNOWN_IMAGE_MODELS = (
@@ -155,9 +159,68 @@ def is_model_unavailable_error(message: str) -> bool:
     )
 
 
-def generation_kwargs(model: str, args: argparse.Namespace) -> dict[str, object]:
+def is_ambiguous_generation_error(exc: Exception) -> bool:
+    """请求可能已在服务端执行；此类错误禁止自动重试和候选回退。"""
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and (status_code in {408, 409, 429} or status_code >= 500):
+        return True
+    name = type(exc).__name__.casefold()
+    message = str(exc).casefold()
+    return any(
+        marker in name or marker in message
+        for marker in ("timeout", "timed out", "connectionerror", "connection error", "readerror")
+    )
+
+
+def remote_request_id(exc: Exception) -> str | None:
+    value = getattr(exc, "request_id", None)
+    if isinstance(value, str) and value:
+        return value
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    value = headers.get("x-request-id") if headers is not None else None
+    return value if isinstance(value, str) and value else None
+
+
+def make_request_id(value: str | None) -> str:
+    if value is None:
+        return uuid.uuid4().hex
+    request_id = value.strip()
+    if not re.fullmatch(rf"[A-Za-z0-9._:-]{{1,{MAX_REQUEST_ID_LENGTH}}}", request_id):
+        fail(
+            f"request-id 只能包含 ASCII 字母、数字、点、下划线、冒号或连字符，"
+            f"长度不超过 {MAX_REQUEST_ID_LENGTH}"
+        )
+    return request_id
+
+
+def attempt_idempotency_key(request_id: str, model: str) -> str:
+    suffix = hashlib.sha256(model.encode("utf-8")).hexdigest()[:16]
+    return f"{request_id}:{suffix}"
+
+
+def unknown_generation_message(
+    model: str, request_id: str, reason: str, exc: Exception | None = None
+) -> str:
+    provider_id = remote_request_id(exc) if exc is not None else None
+    provider_note = f", provider_request_id={provider_id}" if provider_id else ""
+    return (
+        f"图片生成结果未知（model={model}, request_id={request_id}{provider_note}）：{reason}；"
+        "已禁止自动重试和模型回退。请先向服务端查询该幂等键，再决定是否用同一 request-id 重试"
+    )
+
+
+def generation_kwargs(
+    model: str, args: argparse.Namespace, idempotency_key: str
+) -> dict[str, object]:
     """只发送目标模型支持的常用参数，避免 fallback 被 gpt 专属参数阻断。"""
-    kwargs: dict[str, object] = {"model": model, "prompt": args.prompt, "n": 1, "size": args.size}
+    kwargs: dict[str, object] = {
+        "model": model,
+        "prompt": args.prompt,
+        "n": 1,
+        "size": args.size,
+        "extra_headers": {"Idempotency-Key": idempotency_key},
+    }
     key = model_key(model)
     if key.startswith("gpt-image"):
         kwargs.update(quality=args.quality, output_format="png")
@@ -166,13 +229,15 @@ def generation_kwargs(model: str, args: argparse.Namespace) -> dict[str, object]
     return kwargs
 
 
-def list_image_models(client: object, secret: str) -> list[str]:
+def list_image_models(client: object, secret: str, request_id: str) -> list[str]:
     try:
         response = client.models.list()
     except Exception as exc:
         message = redact(str(exc), secret)
         if is_quota_error(message):
             fail("API 额度不足（insufficient_quota）；请更换有额度的 auth JSON，不要重试")
+        if is_ambiguous_generation_error(exc):
+            fail(f"模型发现请求超时或连接不确定（request_id={request_id}）；未发起图片生成，请勿自动重试")
         fail(f"无法查询可用模型: {message}")
     models = select_image_models(getattr(response, "data", response))
     if not models:
@@ -185,18 +250,19 @@ def download_image(url: str, timeout: float) -> bytes:
     if url.startswith("data:"):
         header, payload = url.split(",", 1)
         if ";base64" not in header:
-            fail("不支持非 base64 data URL")
+            raise ValueError("不支持非 base64 data URL")
         return base64.b64decode(payload)
 
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        fail("图片 URL 不是可下载的 HTTP(S) URL")
+        raise ValueError("图片 URL 不是可下载的 HTTP(S) URL")
     request = Request(url, headers={"User-Agent": "codex-imagegen-auth"})
     try:
         with urlopen(request, timeout=timeout) as response:
             return response.read()
     except Exception as exc:
-        fail(f"下载代理返回的图片 URL 失败: {exc}")
+        # 不把签名 URL（可能含敏感查询参数）写入错误日志。
+        raise RuntimeError(f"下载代理返回的图片 URL 失败: {type(exc).__name__}") from exc
 
 
 def parse_args() -> argparse.Namespace:
@@ -207,6 +273,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--size", default="1024x1024")
     parser.add_argument("--quality", choices=("low", "medium", "high", "auto"), default="medium")
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument(
+        "--request-id",
+        help="逻辑请求 ID；超时后仅在服务端支持幂等键时用同一 ID 查询/重试",
+    )
     parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
     return parser.parse_args()
 
@@ -219,17 +289,20 @@ def main() -> int:
         fail("timeout 必须大于 0")
 
     key, base_url = load_auth(args.auth)
+    request_id = make_request_id(args.request_id)
+    output = Path(args.out).expanduser()
+    if output.exists() and not args.force:
+        fail(f"输出已存在: {output}（需要覆盖时加 --force）")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
     try:
         from openai import OpenAI
     except ImportError:
         fail("缺少 openai SDK；请使用 uv run --no-project --with openai python ...", 2)
 
     client = OpenAI(api_key=key, base_url=base_url, timeout=args.timeout, max_retries=0)
-    models = list_image_models(client, key)
-    output = Path(args.out).expanduser()
-    if output.exists() and not args.force:
-        fail(f"输出已存在: {output}（需要覆盖时加 --force）")
-    output.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Request ID: {request_id}", file=sys.stderr)
+    models = list_image_models(client, key, request_id)
 
     result = None
     selected_model = None
@@ -237,11 +310,15 @@ def main() -> int:
     for model in models:
         print(f"Calling {model} via {urlparse(base_url).netloc or base_url} ...", file=sys.stderr)
         try:
-            result = client.images.generate(**generation_kwargs(model, args))
+            result = client.images.generate(
+                **generation_kwargs(model, args, attempt_idempotency_key(request_id, model))
+            )
         except Exception as exc:
             message = redact(str(exc), key)
             if is_quota_error(message):
                 fail("API 额度不足（insufficient_quota）；请更换有额度的 auth JSON，不要重试")
+            if is_ambiguous_generation_error(exc):
+                fail(unknown_generation_message(model, request_id, message, exc))
             if is_model_unavailable_error(message):
                 unavailable_errors.append(f"{model}: {message}")
                 print(f"Model {model} unavailable; trying next candidate.", file=sys.stderr)
@@ -254,7 +331,7 @@ def main() -> int:
         details = "; ".join(unavailable_errors)
         fail(f"所有可用图片模型均不可用{f': {details}' if details else ''}")
     if not getattr(result, "data", None):
-        fail(f"Image API 返回空 data（{selected_model}）")
+        fail(unknown_generation_message(selected_model or "unknown", request_id, "Image API 返回空 data"))
     item = result.data[0]
     b64_json = item_field(item, "b64_json")
     image_url = item_field(item, "url")
@@ -262,15 +339,29 @@ def main() -> int:
         try:
             raw = base64.b64decode(b64_json, validate=True)
         except Exception as exc:
-            fail(f"b64_json 解码失败: {exc}")
+            fail(unknown_generation_message(selected_model or "unknown", request_id, "b64_json 解码失败", exc))
     elif isinstance(image_url, str) and image_url:
-        raw = download_image(image_url, args.timeout)
+        try:
+            raw = download_image(image_url, args.timeout)
+        except Exception as exc:
+            fail(unknown_generation_message(selected_model or "unknown", request_id, str(exc), exc))
     else:
-        fail("响应既没有 b64_json 也没有 url")
+        fail(unknown_generation_message(selected_model or "unknown", request_id, "响应既没有 b64_json 也没有 url"))
 
     if not raw:
-        fail("下载到空图片")
-    output.write_bytes(raw)
+        fail(unknown_generation_message(selected_model or "unknown", request_id, "下载到空图片"))
+    temporary = tempfile.NamedTemporaryFile(
+        dir=output.parent, prefix=f".{output.name}.", suffix=".tmp", delete=False
+    )
+    temporary_path = Path(temporary.name)
+    try:
+        with temporary:
+            temporary.write(raw)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, output)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     print(f"Wrote {output.resolve()} (model={selected_model})")
     return 0
 
