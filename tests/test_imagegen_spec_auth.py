@@ -50,7 +50,7 @@ class ImagegenSpecAuthTest(unittest.TestCase):
             def __init__(self, **kwargs):
                 self.images = Images()
                 self.models = SimpleNamespace(
-                    list=lambda: SimpleNamespace(data=[SimpleNamespace(id="gpt-image-2"), SimpleNamespace(id="dall-e-3")])
+                    list=lambda: SimpleNamespace(data=[SimpleNamespace(id="gpt-image-2"), SimpleNamespace(id="grok-imagine-image")])
                 )
                 self.options = kwargs
 
@@ -142,6 +142,249 @@ class ImagegenSpecAuthTest(unittest.TestCase):
         sleep.assert_called_once_with(0.0)
         self.assertIn("结果未知", stderr.getvalue())
 
+    def test_unstable_model_fails_over_within_five_attempts(self):
+        calls = []
+        sleep_calls = []
+
+        class Retryable524(Exception):
+            status_code = 524
+            body = {"retryable": True, "retry_after": 0}
+
+        class Images:
+            def generate(self, **kwargs):
+                calls.append(kwargs)
+                if kwargs["model"] == "gpt-image-2":
+                    raise Retryable524("origin timeout")
+                return SimpleNamespace(
+                    data=[SimpleNamespace(b64_json=base64.b64encode(b"png").decode(), url=None)]
+                )
+
+        class Client:
+            def __init__(self, **kwargs):
+                self.images = Images()
+                self.models = SimpleNamespace(
+                    list=lambda: SimpleNamespace(
+                        data=[
+                            SimpleNamespace(id="gpt-image-2"),
+                            SimpleNamespace(id="grok-imagine-image"),
+                        ]
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "out.png"
+            auth, argv = self.auth_and_args(directory, output, "failover-1")
+            with patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=Client)}), patch.object(
+                sys, "argv", argv
+            ), patch.object(imagegen.time, "sleep", side_effect=sleep_calls.append):
+                self.assertEqual(imagegen.main(), 0)
+            generated = output.read_bytes()
+
+        self.assertEqual(generated, b"png")
+        self.assertEqual([call["model"] for call in calls], ["gpt-image-2", "gpt-image-2", "grok-imagine-image"])
+        self.assertEqual(calls[0]["extra_headers"]["Idempotency-Key"], calls[1]["extra_headers"]["Idempotency-Key"])
+        self.assertNotEqual(calls[1]["extra_headers"]["Idempotency-Key"], calls[2]["extra_headers"]["Idempotency-Key"])
+        self.assertEqual(sleep_calls, [0.0])
+
+    def test_capacity_unavailable_retries_same_model_before_success(self):
+        calls = []
+        sleep_calls = []
+
+        class CapacityUnavailable503(Exception):
+            status_code = 503
+            body = {"detail": "No available channel for model grok-imagine-image"}
+
+        class Images:
+            def generate(self, **kwargs):
+                calls.append(kwargs)
+                if kwargs["model"] == "gpt-image-2":
+                    raise RuntimeError("model not found")
+                if len([call for call in calls if call["model"] == "grok-imagine-image"]) < 3:
+                    raise CapacityUnavailable503("dispatcher capacity unavailable")
+                return SimpleNamespace(
+                    data=[SimpleNamespace(b64_json=base64.b64encode(b"png").decode(), url=None)]
+                )
+
+        class Client:
+            def __init__(self, **kwargs):
+                self.images = Images()
+                self.models = SimpleNamespace(
+                    list=lambda: SimpleNamespace(
+                        data=[
+                            SimpleNamespace(id="gpt-image-2"),
+                            SimpleNamespace(id="grok-imagine-image"),
+                        ]
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "out.png"
+            auth, argv = self.auth_and_args(directory, output, "capacity-retry")
+            with patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=Client)}), patch.object(
+                sys, "argv", argv
+            ), patch.object(imagegen.time, "sleep", side_effect=sleep_calls.append):
+                self.assertEqual(imagegen.main(), 0)
+
+        self.assertEqual(
+            [call["model"] for call in calls],
+            [
+                "gpt-image-2",
+                "grok-imagine-image",
+                "grok-imagine-image",
+                "grok-imagine-image",
+            ],
+        )
+        self.assertEqual(sleep_calls, [imagegen.CAPACITY_RETRY_DELAY_SECONDS] * 2)
+        self.assertEqual(
+            calls[1]["extra_headers"]["Idempotency-Key"],
+            calls[2]["extra_headers"]["Idempotency-Key"],
+        )
+
+    def test_capacity_unavailable_on_gpt_fails_over_to_grok(self):
+        calls = []
+        sleep_calls = []
+
+        class CapacityUnavailable503(Exception):
+            status_code = 503
+            body = {"detail": "No available channel for model gpt-image-2"}
+
+        class Images:
+            def generate(self, **kwargs):
+                calls.append(kwargs)
+                if kwargs["model"] == "gpt-image-2":
+                    raise CapacityUnavailable503("dispatcher capacity unavailable")
+                return SimpleNamespace(
+                    data=[SimpleNamespace(b64_json=base64.b64encode(b"png").decode(), url=None)]
+                )
+
+        class Client:
+            def __init__(self, **kwargs):
+                self.images = Images()
+                self.models = SimpleNamespace(
+                    list=lambda: SimpleNamespace(
+                        data=[
+                            SimpleNamespace(id="gpt-image-2"),
+                            SimpleNamespace(id="grok-imagine-image"),
+                        ]
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "out.png"
+            auth, argv = self.auth_and_args(directory, output, "gpt-capacity-failover")
+            with patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=Client)}), patch.object(
+                sys, "argv", argv
+            ), patch.object(imagegen.time, "sleep", side_effect=sleep_calls.append):
+                self.assertEqual(imagegen.main(), 0)
+
+        self.assertEqual([call["model"] for call in calls], [
+            "gpt-image-2",
+            "gpt-image-2",
+            "grok-imagine-image",
+        ])
+        self.assertEqual(sleep_calls, [imagegen.CAPACITY_RETRY_DELAY_SECONDS])
+
+    def test_capacity_retries_stop_at_global_attempt_limit(self):
+        calls = []
+        sleep_calls = []
+
+        class CapacityUnavailable503(Exception):
+            status_code = 503
+            body = {"detail": "No available channel for model grok-imagine-image"}
+
+        class Images:
+            def generate(self, **kwargs):
+                calls.append(kwargs)
+                if kwargs["model"] == "gpt-image-2":
+                    raise RuntimeError("model not found")
+                raise CapacityUnavailable503("dispatcher capacity unavailable")
+
+        class Client:
+            def __init__(self, **kwargs):
+                self.images = Images()
+                self.models = SimpleNamespace(
+                    list=lambda: SimpleNamespace(
+                        data=[
+                            SimpleNamespace(id="gpt-image-2"),
+                            SimpleNamespace(id="grok-imagine-image"),
+                        ]
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "out.png"
+            auth, argv = self.auth_and_args(directory, output, "capacity-max-five")
+            with patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=Client)}), patch.object(
+                sys, "argv", argv
+            ), patch.object(imagegen.time, "sleep", side_effect=sleep_calls.append):
+                with self.assertRaises(SystemExit) as raised:
+                    imagegen.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(len(calls), imagegen.MAX_GENERATION_ATTEMPTS)
+        self.assertEqual([call["model"] for call in calls], [
+            "gpt-image-2",
+            "grok-imagine-image",
+            "grok-imagine-image",
+            "grok-imagine-image",
+            "grok-imagine-image",
+        ])
+        self.assertEqual(sleep_calls, [imagegen.CAPACITY_RETRY_DELAY_SECONDS] * 3)
+
+    def test_total_generation_attempts_never_exceed_five(self):
+        calls = []
+
+        class Retryable524(Exception):
+            status_code = 524
+            body = {"retryable": True, "retry_after": 0}
+
+        class Images:
+            def generate(self, **kwargs):
+                calls.append(kwargs)
+                raise Retryable524("origin timeout")
+
+        class Client:
+            def __init__(self, **kwargs):
+                self.images = Images()
+                self.models = SimpleNamespace(
+                    list=lambda: SimpleNamespace(
+                        data=[
+                            SimpleNamespace(id="gpt-image-2"),
+                            SimpleNamespace(id="grok-imagine-image"),
+                            SimpleNamespace(id="dall-e-3"),
+                        ]
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "out.png"
+            auth, argv = self.auth_and_args(directory, output, "max-five")
+            stderr = StringIO()
+            with patch.dict(sys.modules, {"openai": SimpleNamespace(OpenAI=Client)}), patch.object(
+                sys, "argv", argv
+            ), redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    imagegen.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertLessEqual(len(calls), imagegen.MAX_GENERATION_ATTEMPTS)
+        self.assertEqual(len(calls), 4)
+        self.assertNotIn("dall-e-3", [call["model"] for call in calls])
+
+    def test_only_requested_models_are_selected(self):
+        selected = imagegen.select_image_models(
+            {
+                "data": [
+                    {"id": "gpt-image-2-pro"},
+                    {"id": "grok-imagine-image"},
+                    {"id": "nano-banana-2"},
+                    {"id": "gpt-image-2"},
+                    {"id": "dall-e-3"},
+                ]
+            }
+        )
+        self.assertEqual(selected, ["gpt-image-2", "grok-imagine-image"])
+
     def test_fallback_uses_distinct_idempotency_keys_and_atomic_output(self):
         calls = []
         client_options = []
@@ -159,7 +402,9 @@ class ImagegenSpecAuthTest(unittest.TestCase):
             def __init__(self, **kwargs):
                 self.images = Images()
                 self.models = SimpleNamespace(
-                    list=lambda: SimpleNamespace(data=[SimpleNamespace(id="gpt-image-2"), SimpleNamespace(id="dall-e-3")])
+                    list=lambda: SimpleNamespace(
+                        data=[SimpleNamespace(id="gpt-image-2"), SimpleNamespace(id="grok-imagine-image")]
+                    )
                 )
                 client_options.append(kwargs)
 
@@ -170,7 +415,7 @@ class ImagegenSpecAuthTest(unittest.TestCase):
                 self.assertEqual(imagegen.main(), 0)
 
             self.assertEqual(output.read_bytes(), b"png")
-            self.assertEqual([call["model"] for call in calls], ["gpt-image-2", "dall-e-3"])
+            self.assertEqual([call["model"] for call in calls], ["gpt-image-2", "grok-imagine-image"])
             self.assertNotEqual(
                 calls[0]["extra_headers"]["Idempotency-Key"], calls[1]["extra_headers"]["Idempotency-Key"]
             )

@@ -23,39 +23,15 @@ DEFAULT_AUTH = "~/.config/ai/imagegen.auth.json"
 DEFAULT_OUT = "output/imagegen/image.png"
 MAX_REQUEST_ID_LENGTH = 96
 MAX_PROVIDER_RETRIES = 1
+MAX_CAPACITY_RETRIES = 4
 MAX_RETRY_AFTER_SECONDS = 300.0
+MAX_GENERATION_ATTEMPTS = 5
+CAPACITY_RETRY_DELAY_SECONDS = 5.0
 
-# 排序值越小越优先；其余带有明确图片生成标识的模型排在已知模型之后。
-KNOWN_IMAGE_MODELS = (
+# 只允许这两个候选，顺序也是 failover 顺序。
+IMAGE_MODEL_ORDER = (
     "gpt-image-2",
-    "gpt-image-1",
-    "gpt-image-1-mini",
-    "dall-e-3",
-    "dall-e-2",
-)
-IMAGE_MODEL_HINTS = (
-    "gpt-image",
-    "dall-e",
-    "imagen",
-    "stable-diffusion",
-    "stable_diffusion",
-    "sdxl",
-    "flux",
-    "ideogram",
-    "midjourney",
-    "nano-banana",
-    "image-generation",
-    "text-to-image",
-)
-NON_GENERATIVE_HINTS = (
-    "embedding",
-    "vision",
-    "caption",
-    "ocr",
-    "moderation",
-    "upscale",
-    "inpaint",
-    "edit",
+    "grok-imagine-image",
 )
 
 
@@ -102,17 +78,10 @@ def model_key(model: str) -> str:
 
 def image_model_rank(model: str) -> int | None:
     key = model_key(model)
-    for rank, known in enumerate(KNOWN_IMAGE_MODELS):
-        if key == known or key.startswith(f"{known}-"):
-            return rank
-    if any(hint in key for hint in NON_GENERATIVE_HINTS):
+    try:
+        return IMAGE_MODEL_ORDER.index(key)
+    except ValueError:
         return None
-    if any(hint in key for hint in IMAGE_MODEL_HINTS):
-        return 100
-    # 一些兼容代理把生成模型命名为 *-image-preview；排除视觉/嵌入模型后再接纳。
-    if "image" in key:
-        return 100
-    return None
 
 
 def select_image_models(items: object) -> list[str]:
@@ -163,6 +132,30 @@ def is_model_unavailable_error(message: str) -> bool:
     )
 
 
+def is_fatal_generation_error(exc: Exception, message: str) -> bool:
+    """认证、权限或提示词错误不会因换模型而恢复。"""
+    status_code = getattr(exc, "status_code", None)
+    if status_code in {400, 401, 403}:
+        return any(
+            marker in message.casefold()
+            for marker in (
+                "authentication",
+                "unauthorized",
+                "invalid api key",
+                "permission",
+                "forbidden",
+                "content policy",
+                "invalid prompt",
+                "prompt is required",
+            )
+        ) or status_code in {401, 403}
+    lowered = message.casefold()
+    return any(
+        marker in lowered
+        for marker in ("invalid api key", "authentication failed", "content policy", "invalid prompt")
+    )
+
+
 def is_ambiguous_generation_error(exc: Exception) -> bool:
     """请求可能已在服务端执行；此类错误禁止自动重试和候选回退。"""
     status_code = getattr(exc, "status_code", None)
@@ -173,6 +166,16 @@ def is_ambiguous_generation_error(exc: Exception) -> bool:
     return any(
         marker in name or marker in message
         for marker in ("timeout", "timed out", "connectionerror", "connection error", "readerror")
+    )
+
+
+def is_capacity_unavailable_error(exc: Exception, message: str) -> bool:
+    """503 分发器无通道表示请求尚未进入模型生成，可安全复用幂等键重试。"""
+    status_code = getattr(exc, "status_code", None)
+    lowered = message.casefold()
+    return status_code == 503 and any(
+        marker in lowered
+        for marker in ("no available channel", "no available channels", "capacity unavailable")
     )
 
 
@@ -234,7 +237,7 @@ def unknown_generation_message(
     provider_note = f", provider_request_id={provider_id}" if provider_id else ""
     return (
         f"图片生成结果未知（model={model}, request_id={request_id}{provider_note}）：{reason}；"
-        "已禁止自动重试和模型回退。请先向服务端查询该幂等键，再决定是否用同一 request-id 重试"
+        "已停止本次逻辑请求的继续尝试。请先向服务端查询该幂等键，再决定是否用同一 request-id 重试"
     )
 
 
@@ -260,6 +263,15 @@ def provider_retry_delay(exc: Exception) -> float | None:
     return None
 
 
+def safe_retry_delay(exc: Exception, message: str) -> float | None:
+    delay = provider_retry_delay(exc)
+    if delay is not None:
+        return delay
+    if is_capacity_unavailable_error(exc, message):
+        return CAPACITY_RETRY_DELAY_SECONDS
+    return None
+
+
 def generation_kwargs(
     model: str, args: argparse.Namespace, idempotency_key: str
 ) -> dict[str, object]:
@@ -274,8 +286,6 @@ def generation_kwargs(
     key = model_key(model)
     if key.startswith("gpt-image"):
         kwargs.update(quality=args.quality, output_format="png")
-    elif key == "dall-e-3":
-        kwargs["quality"] = "hd" if args.quality == "high" else "standard"
     return kwargs
 
 
@@ -358,10 +368,17 @@ def main() -> int:
     result = None
     selected_model = None
     unavailable_errors: list[str] = []
-    for model in models:
+    generation_attempts = 0
+    for model_index, model in enumerate(models):
+        if generation_attempts >= MAX_GENERATION_ATTEMPTS:
+            break
+        has_next_model = model_index + 1 < len(models)
         idempotency_key = attempt_idempotency_key(request_id, model)
         retry_count = 0
         while True:
+            if generation_attempts >= MAX_GENERATION_ATTEMPTS:
+                break
+            generation_attempts += 1
             print(f"Calling {model} via {urlparse(base_url).netloc or base_url} ...", file=sys.stderr)
             try:
                 result = client.images.generate(
@@ -370,17 +387,25 @@ def main() -> int:
             except Exception as exc:
                 raw_message = redact(str(exc), key)
                 message = error_summary(exc, key)
-                if retry_count:
-                    fail(unknown_generation_message(model, request_id, message, exc))
-                if is_quota_error(raw_message):
+                error_text = f"{raw_message} {message}"
+                if is_quota_error(error_text):
                     fail("API 额度不足（insufficient_quota）；请更换有额度的 auth JSON，不要重试")
+                if is_fatal_generation_error(exc, error_text):
+                    fail(f"Image API 调用失败（{model}）: {message}")
                 ambiguous = is_ambiguous_generation_error(exc)
-                if not ambiguous and is_model_unavailable_error(raw_message):
+                capacity_error = is_capacity_unavailable_error(exc, message)
+                if not ambiguous and not capacity_error and is_model_unavailable_error(error_text):
                     unavailable_errors.append(f"{model}: {message}")
                     print(f"Model {model} unavailable; trying next candidate.", file=sys.stderr)
                     break
-                delay = provider_retry_delay(exc)
-                if delay is not None and retry_count < MAX_PROVIDER_RETRIES:
+                if generation_attempts >= MAX_GENERATION_ATTEMPTS:
+                    fail(f"已达到最多 {MAX_GENERATION_ATTEMPTS} 次图片生成尝试（最后模型：{model}）")
+                delay = safe_retry_delay(exc, message)
+                retry_limit = MAX_PROVIDER_RETRIES
+                if capacity_error:
+                    # 有后续模型时尽快 failover；最后一个模型可用完剩余总次数等待容量恢复。
+                    retry_limit = 1 if has_next_model else MAX_CAPACITY_RETRIES
+                if delay is not None and retry_count < retry_limit:
                     retry_count += 1
                     print(
                         f"Provider marked {model} retryable; waiting {delay:g}s and reusing the same idempotency key.",
@@ -388,8 +413,22 @@ def main() -> int:
                     )
                     time.sleep(delay)
                     continue
+                if retry_count:
+                    if has_next_model:
+                        print(
+                            f"Model {model} remained unstable after safe retries; failing over to the next image model.",
+                            file=sys.stderr,
+                        )
+                        break
+                    fail(unknown_generation_message(model, request_id, message, exc))
                 if ambiguous:
                     fail(unknown_generation_message(model, request_id, message, exc))
+                if has_next_model and generation_attempts < MAX_GENERATION_ATTEMPTS:
+                    print(
+                        f"Model {model} failed; failing over to the next image model.",
+                        file=sys.stderr,
+                    )
+                    break
                 fail(f"Image API 调用失败（{model}）: {message}")
             else:
                 selected_model = model
@@ -399,6 +438,8 @@ def main() -> int:
 
     if result is None:
         details = "; ".join(unavailable_errors)
+        if generation_attempts >= MAX_GENERATION_ATTEMPTS:
+            fail(f"已达到最多 {MAX_GENERATION_ATTEMPTS} 次图片生成尝试，未得到可用结果")
         fail(f"所有可用图片模型均不可用{f': {details}' if details else ''}")
     if not getattr(result, "data", None):
         fail(unknown_generation_message(selected_model or "unknown", request_id, "Image API 返回空 data"))
@@ -432,7 +473,7 @@ def main() -> int:
         os.replace(temporary_path, output)
     finally:
         temporary_path.unlink(missing_ok=True)
-    print(f"Wrote {output.resolve()} (model={selected_model})")
+    print(f"Wrote {output.resolve()} (model={selected_model}, attempts={generation_attempts})")
     return 0
 
 

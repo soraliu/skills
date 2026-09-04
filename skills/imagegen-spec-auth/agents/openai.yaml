@@ -1,5 +1,5 @@
 interface:
   display_name: "ImageGen Spec Auth"
-  short_description: "发现模型并安全处理超时重试与扣款"
+  short_description: "仅按 gpt-image-2 到 grok-imagine-image failover"
   default_prompt: "使用 $imagegen-spec-auth 从指定 auth JSON 发现可用图片模型并生成一张图片。"
   brand_color: "#6D5EF8"
