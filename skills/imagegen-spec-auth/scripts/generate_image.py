@@ -7,11 +7,13 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import sys
 import tempfile
+import time
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 import uuid
@@ -20,6 +22,8 @@ import uuid
 DEFAULT_AUTH = "~/.config/ai/imagegen.auth.json"
 DEFAULT_OUT = "output/imagegen/image.png"
 MAX_REQUEST_ID_LENGTH = 96
+MAX_PROVIDER_RETRIES = 1
+MAX_RETRY_AFTER_SECONDS = 300.0
 
 # 排序值越小越优先；其余带有明确图片生成标识的模型排在已知模型之后。
 KNOWN_IMAGE_MODELS = (
@@ -182,6 +186,30 @@ def remote_request_id(exc: Exception) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def error_summary(exc: Exception, secret: str = "") -> str:
+    """提取短错误摘要，避免把代理完整响应或签名 URL 写入日志。"""
+    status_code = getattr(exc, "status_code", None)
+    body = getattr(exc, "body", None)
+    payloads = [body]
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        payloads.append(body["error"])
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        detail = next(
+            (
+                payload.get(field)
+                for field in ("detail", "message", "title", "error_name", "code", "type")
+                if isinstance(payload.get(field), str) and payload.get(field)
+            ),
+            None,
+        )
+        if detail:
+            prefix = f"HTTP {status_code}: " if isinstance(status_code, int) else ""
+            return f"{prefix}{detail}"[:500]
+    return redact(str(exc), secret).replace("\n", " ")[:500]
+
+
 def make_request_id(value: str | None) -> str:
     if value is None:
         return uuid.uuid4().hex
@@ -210,6 +238,28 @@ def unknown_generation_message(
     )
 
 
+def provider_retry_delay(exc: Exception) -> float | None:
+    """只接受服务端明确声明 retryable=true 且给出有限等待时间的重试。"""
+    body = getattr(exc, "body", None)
+    bodies = [body]
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        bodies.append(body["error"])
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    for candidate in bodies:
+        if not isinstance(candidate, dict) or candidate.get("retryable") is not True:
+            continue
+        value = candidate.get("retry_after")
+        if value is None and headers is not None:
+            value = headers.get("retry-after")
+        try:
+            delay = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isfinite(delay) and 0 <= delay <= MAX_RETRY_AFTER_SECONDS:
+            return delay
+    return None
+
+
 def generation_kwargs(
     model: str, args: argparse.Namespace, idempotency_key: str
 ) -> dict[str, object]:
@@ -233,8 +283,9 @@ def list_image_models(client: object, secret: str, request_id: str) -> list[str]
     try:
         response = client.models.list()
     except Exception as exc:
-        message = redact(str(exc), secret)
-        if is_quota_error(message):
+        raw_message = redact(str(exc), secret)
+        message = error_summary(exc, secret)
+        if is_quota_error(raw_message):
             fail("API 额度不足（insufficient_quota）；请更换有额度的 auth JSON，不要重试")
         if is_ambiguous_generation_error(exc):
             fail(f"模型发现请求超时或连接不确定（request_id={request_id}）；未发起图片生成，请勿自动重试")
@@ -308,24 +359,43 @@ def main() -> int:
     selected_model = None
     unavailable_errors: list[str] = []
     for model in models:
-        print(f"Calling {model} via {urlparse(base_url).netloc or base_url} ...", file=sys.stderr)
-        try:
-            result = client.images.generate(
-                **generation_kwargs(model, args, attempt_idempotency_key(request_id, model))
-            )
-        except Exception as exc:
-            message = redact(str(exc), key)
-            if is_quota_error(message):
-                fail("API 额度不足（insufficient_quota）；请更换有额度的 auth JSON，不要重试")
-            if is_ambiguous_generation_error(exc):
-                fail(unknown_generation_message(model, request_id, message, exc))
-            if is_model_unavailable_error(message):
-                unavailable_errors.append(f"{model}: {message}")
-                print(f"Model {model} unavailable; trying next candidate.", file=sys.stderr)
-                continue
-            fail(f"Image API 调用失败（{model}）: {message}")
-        selected_model = model
-        break
+        idempotency_key = attempt_idempotency_key(request_id, model)
+        retry_count = 0
+        while True:
+            print(f"Calling {model} via {urlparse(base_url).netloc or base_url} ...", file=sys.stderr)
+            try:
+                result = client.images.generate(
+                    **generation_kwargs(model, args, idempotency_key)
+                )
+            except Exception as exc:
+                raw_message = redact(str(exc), key)
+                message = error_summary(exc, key)
+                if retry_count:
+                    fail(unknown_generation_message(model, request_id, message, exc))
+                if is_quota_error(raw_message):
+                    fail("API 额度不足（insufficient_quota）；请更换有额度的 auth JSON，不要重试")
+                ambiguous = is_ambiguous_generation_error(exc)
+                if not ambiguous and is_model_unavailable_error(raw_message):
+                    unavailable_errors.append(f"{model}: {message}")
+                    print(f"Model {model} unavailable; trying next candidate.", file=sys.stderr)
+                    break
+                delay = provider_retry_delay(exc)
+                if delay is not None and retry_count < MAX_PROVIDER_RETRIES:
+                    retry_count += 1
+                    print(
+                        f"Provider marked {model} retryable; waiting {delay:g}s and reusing the same idempotency key.",
+                        file=sys.stderr,
+                    )
+                    time.sleep(delay)
+                    continue
+                if ambiguous:
+                    fail(unknown_generation_message(model, request_id, message, exc))
+                fail(f"Image API 调用失败（{model}）: {message}")
+            else:
+                selected_model = model
+                break
+        if result is not None:
+            break
 
     if result is None:
         details = "; ".join(unavailable_errors)
