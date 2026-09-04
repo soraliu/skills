@@ -1,0 +1,5 @@
+interface:
+  display_name: "ImageGen Spec Auth"
+  short_description: "从 auth JSON 发现模型并优先使用 gpt-image-2"
+  default_prompt: "使用 $imagegen-spec-auth 从指定 auth JSON 发现可用图片模型并生成一张图片。"
+  brand_color: "#6D5EF8"
