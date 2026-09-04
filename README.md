@@ -30,6 +30,18 @@ $understand-repo assess repo
 /understand-repo assess repo
 ```
 
+### `imagegen-spec-auth`
+
+通过指定 auth JSON 查询 OpenAI 兼容 Image API 的可用模型，优先使用 `gpt-image-2`，不可用时回退到其他图片生成模型。
+
+```text
+# Codex
+$imagegen-spec-auth 使用指定 auth JSON 生成一张图片
+
+# Claude Code / Hermes
+/imagegen-spec-auth 使用指定 auth JSON 生成一张图片
+```
+
 ## 安装
 
 使用 [skills CLI](https://github.com/vercel-labs/skills) 安装：
@@ -40,6 +52,9 @@ npx skills add soraliu/skills --skill discover-open-source
 
 # 安装仓库理解 Skill
 npx skills add soraliu/skills --skill understand-repo
+
+# 安装图片生成 Skill
+npx skills add soraliu/skills --skill imagegen-spec-auth
 
 # Codex
 npx skills add soraliu/skills --skill discover-open-source --agent codex
@@ -77,6 +92,7 @@ Codex 也可以通过 `$skill-installer` 安装：
 ```text
 $skill-installer install https://github.com/soraliu/skills/tree/main/skills/discover-open-source
 $skill-installer install https://github.com/soraliu/skills/tree/main/skills/understand-repo
+$skill-installer install https://github.com/soraliu/skills/tree/main/skills/imagegen-spec-auth
 ```
 
 Hermes 可以直接安装单个 Skill，或把仓库注册为 tap：
@@ -84,6 +100,7 @@ Hermes 可以直接安装单个 Skill，或把仓库注册为 tap：
 ```bash
 hermes skills install soraliu/skills/skills/discover-open-source
 hermes skills install soraliu/skills/skills/understand-repo
+hermes skills install soraliu/skills/skills/imagegen-spec-auth
 
 hermes skills tap add soraliu/skills
 hermes skills install soraliu/skills/discover-open-source
