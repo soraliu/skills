@@ -20,7 +20,7 @@ import uuid
 
 
 DEFAULT_AUTH = "~/.config/ai/imagegen.auth.json"
-DEFAULT_OUT = "output/imagegen/image.png"
+DEFAULT_OUT = "~/.output/imagegen/image.png"
 MAX_REQUEST_ID_LENGTH = 96
 MAX_PROVIDER_RETRIES = 1
 MAX_CAPACITY_RETRIES = 4

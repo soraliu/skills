@@ -20,6 +20,13 @@ SPEC.loader.exec_module(imagegen)
 
 
 class ImagegenSpecAuthTest(unittest.TestCase):
+    def test_default_output_is_user_scoped(self):
+        with patch.object(sys, "argv", ["generate_image.py", "--prompt", "数码 3C 产品静物图"]):
+            args = imagegen.parse_args()
+
+        self.assertEqual(args.out, "~/.output/imagegen/image.png")
+        self.assertEqual(Path(args.out).expanduser(), Path.home() / ".output/imagegen/image.png")
+
     def auth_and_args(self, directory: str, output: Path, request_id: str = "smoke-1"):
         auth = Path(directory) / "auth.json"
         auth.write_text(json.dumps({"key": "secret", "url": "https://api.example.test"}))
