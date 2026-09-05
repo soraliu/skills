@@ -26,11 +26,11 @@ description: "通过指定 auth JSON 发现 OpenAI 兼容 Image API 的可用模
 uv run --no-project --with openai python \
   ~/.codex/skills/imagegen-spec-auth/scripts/generate_image.py \
   --prompt "<图片提示词>" \
-  --out output/imagegen/image.png \
+  --out ~/.output/imagegen/image.png \
   --request-id "<本次逻辑请求 ID>"
 ```
 
-脚本默认 `1024x1024`、`medium`、单张输出，支持 `--size`、`--quality`、`--timeout`、`--request-id`、`--force` 和 `--auth`。不传 `--request-id` 时脚本自动生成并打印本次 ID；服务端明确允许时脚本会按同一幂等键重试 1 次，模型不稳定时在总计 5 次调用内自动 failover。若最终仍失败，先确认服务端幂等键状态，再决定是否复用该 ID。生成结果应保存到项目的 `output/imagegen/`，再用 `view_image` 做视觉检查。
+脚本默认 `1024x1024`、`medium`、单张输出，默认保存到用户目录下的 `~/.output/imagegen/`，支持 `--size`、`--quality`、`--timeout`、`--request-id`、`--force` 和 `--auth`。不传 `--request-id` 时脚本自动生成并打印本次 ID；服务端明确允许时脚本会按同一幂等键重试 1 次，模型不稳定时在总计 5 次调用内自动 failover。若最终仍失败，先确认服务端幂等键状态，再决定是否复用该 ID。生成结果应保存到 `~/.output/imagegen/`，再用 `view_image` 做视觉检查。
 
 ## 响应与常见陷阱
 
